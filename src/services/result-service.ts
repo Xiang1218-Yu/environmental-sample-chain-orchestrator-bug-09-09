@@ -34,6 +34,7 @@ export class ResultService {
   registerRun(input: RegisterRunInput): InstrumentRun {
     const existing = [...this.store.runs.values()].find((run) => run.projectId === input.projectId && run.externalRunId === input.externalRunId);
     if (existing) {
+      assertCondition(existing.batchId === input.batchId, 'result.run_conflict', 'external run id belongs to a different batch');
       assertCondition(existing.rawFileHash === input.rawFileHash, 'result.run_conflict', 'external run id has a different raw file');
       return existing;
     }
@@ -63,9 +64,18 @@ export class ResultService {
     assertCondition(run.batchId === batch.id && run.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'result does not belong to the requested batch');
     const current = this.findCurrent(input);
     if (current) {
+      // Idempotent replay: re-uploading identical content returns the stored
+      // revision, even if the batch has moved on since the original upload.
       if (current.contentHash === input.contentHash) return current;
+      assertCondition(run.status === 'COMPLETED', 'result.run_not_completed', 'results can only be ingested from completed runs');
+      assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING', 'result.batch_not_accepting', 'batch is not accepting results');
       const next = this.findNextRevision(input, current);
       return this.createRevision(input, next, current.id);
+    }
+    assertCondition(run.status === 'COMPLETED', 'result.run_not_completed', 'results can only be ingested from completed runs');
+    assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING', 'result.batch_not_accepting', 'batch is not accepting results');
+    if (input.aliquotId !== undefined) {
+      assertCondition(batch.memberAliquotIds.includes(input.aliquotId), 'result.aliquot_not_member', 'result aliquot is not a member of the batch');
     }
     return this.createRevision(input, 1);
   }

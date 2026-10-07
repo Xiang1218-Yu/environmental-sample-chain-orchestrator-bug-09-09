@@ -114,6 +114,7 @@ export interface AnalysisBatch extends Versioned {
   projectId: ProjectId;
   protocolVersion: string;
   instrumentType: string;
+  ruleVersion: string;
   status: BatchStatus;
   memberAliquotIds: AliquotId[];
   requiredControls: ControlRequirement[];

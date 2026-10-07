@@ -37,14 +37,20 @@ app.custody.confirmReceipt(transfer.id, { receiverId: 'courier_01', receivedAt: 
 app.receiving.receive({ tenantId, projectId, containerId: sealed.container.id, receivedBy: 'lab_receiver_01', receivedAt: '2026-10-06T10:15:00.000Z', temperatureCelsius: 5, sealStatus: 'INTACT', decision: 'ACCEPTED', clientOperationId: 'receive-001' });
 
 const aliquots = app.aliquots.createMany({ tenantId, projectId, parentContainerId: sealed.container.id, protocolVersion: 'water-v3', createdBy: 'analyst_01', operationId: 'aliquot-001', items: [{ barcode: 'ALQ-001', volumeMl: 20, unit: 'ML' }, { barcode: 'ALQ-002', volumeMl: 20, unit: 'ML' }] });
-const batch = app.batches.create({ tenantId, projectId, protocolVersion: 'water-v3', instrumentType: 'ICP-MS', requiredControls: [{ kind: 'BLANK', minimumCount: 1 }], createdBy: 'analyst_01' });
+const batch = app.batches.create({ tenantId, projectId, protocolVersion: 'water-v3', instrumentType: 'ICP-MS', ruleVersion: 'quality-v2', requiredControls: [{ kind: 'BLANK', minimumCount: 1 }], createdBy: 'analyst_01' });
 for (const aliquot of aliquots) app.batches.addAliquot(batch.id, aliquot.id);
 app.batches.markReady(batch.id);
 app.batches.start(batch.id, '2026-10-06T11:00:00.000Z');
 const run = app.results.registerRun({ tenantId, projectId, batchId: batch.id, externalRunId: 'RUN-001', rawFileHash: 'raw-hash-001', instrumentSoftwareVersion: 'instrument-7.2', startedAt: '2026-10-06T11:10:00.000Z' });
 app.results.completeRun(run.id, '2026-10-06T12:00:00.000Z', 'COMPLETED');
 const result = app.results.ingestRevision({ tenantId, projectId, batchId: batch.id, runId: run.id, ...(aliquots[0] ? { aliquotId: aliquots[0].id } : {}), analyte: 'lead', value: 0.12, unit: 'mg/L', detectionLimit: 0.01, qualityFlags: [], instrumentSoftwareVersion: 'instrument-7.2', contentHash: 'result-hash-001' });
+const secondResult = app.results.ingestRevision({ tenantId, projectId, batchId: batch.id, runId: run.id, ...(aliquots[1] ? { aliquotId: aliquots[1].id } : {}), analyte: 'lead', value: 0.09, unit: 'mg/L', detectionLimit: 0.01, qualityFlags: [], instrumentSoftwareVersion: 'instrument-7.2', contentHash: 'result-hash-002' });
+const blank = app.results.ingestRevision({ tenantId, projectId, batchId: batch.id, runId: run.id, controlKind: 'BLANK', analyte: 'lead', value: 0.001, unit: 'mg/L', detectionLimit: 0.01, qualityFlags: [], instrumentSoftwareVersion: 'instrument-7.2', contentHash: 'result-hash-blank' });
+app.batches.attachControlResult(batch.id, blank.id);
 app.quality.decide({ tenantId, projectId, batchId: batch.id, resultId: result.id, decision: 'APPROVED', reason: 'within protocol limits', ruleVersion: 'quality-v2', reviewerId: 'reviewer_01' });
+app.quality.decide({ tenantId, projectId, batchId: batch.id, resultId: secondResult.id, decision: 'APPROVED', reason: 'within protocol limits', ruleVersion: 'quality-v2', reviewerId: 'reviewer_01' });
+app.quality.decide({ tenantId, projectId, batchId: batch.id, resultId: blank.id, decision: 'APPROVED', reason: 'blank below detection limit', ruleVersion: 'quality-v2', reviewerId: 'reviewer_01' });
+app.quality.approveBatch(batch.id, 'reviewer_01');
 
 console.log(JSON.stringify({
   projectId,
@@ -52,6 +58,7 @@ console.log(JSON.stringify({
   containerId: sealed.container.id,
   aliquotIds: aliquots.map((item) => item.id),
   batchId: batch.id,
+  batchStatus: batch.status,
   resultId: result.id,
   auditCount: app.store.audit.length,
   outboxCount: app.store.outbox.length,
