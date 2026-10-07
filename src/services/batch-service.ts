@@ -61,14 +61,20 @@ export class BatchService {
   start(batchId: string, startedAt: string): AnalysisBatch {
     const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
     assertCondition(batch.status === 'READY', 'batch.invalid_start', 'only ready batches can start');
-    batch.status = 'RUNNING';
-    batch.startedAt = startedAt;
-    batch.frozenAt = startedAt;
-    batch.version += 1;
+    // Validate every member before mutating anything, so a failed start leaves
+    // the batch in READY instead of a half-started RUNNING state.
     for (const aliquotId of batch.memberAliquotIds) {
       const aliquot = assertFound(this.store.aliquots.get(aliquotId), 'aliquot.not_found', 'batch member aliquot not found');
       assertCondition(aliquot.status === 'ALLOCATED', 'batch.member_not_allocated', 'all batch members must be allocated');
     }
+    batch.status = 'RUNNING';
+    batch.startedAt = startedAt;
+    batch.frozenAt = startedAt;
+    // Freeze the member set and the control rules: after this point neither can
+    // be changed, and approval must be evaluated against these snapshots.
+    batch.frozenMemberAliquotIds = [...batch.memberAliquotIds];
+    batch.frozenControlRequirements = structuredClone(batch.requiredControls);
+    batch.version += 1;
     this.store.addAudit({ tenantId: batch.tenantId, projectId: batch.projectId, action: 'batch.started', entity: 'batch', entityId: batch.id, metadata: { protocolVersion: batch.protocolVersion } });
     this.store.addOutbox({ tenantId: batch.tenantId, projectId: batch.projectId, topic: 'batch.started', aggregateId: batch.id, payload: JSON.stringify({ batchId: batch.id, version: batch.version }) });
     return batch;
@@ -76,8 +82,13 @@ export class BatchService {
 
   attachControlResult(batchId: string, resultId: string): void {
     const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
-    // batch, allowing a previous batch's passing control to satisfy approval.
-    assertCondition(!batch.controlResultIds.includes(resultId), 'batch.duplicate_control', 'control result already attached');
+    const result = assertFound(this.store.results.get(resultId), 'batch.control_result_not_found', 'control result not found');
+    assertCondition(result.tenantId === batch.tenantId && result.projectId === batch.projectId && result.batchId === batch.id, 'scope.forbidden', 'control result belongs to a different batch');
+    assertCondition(result.controlKind !== undefined, 'batch.not_a_control', 'only control results can be attached as batch controls');
+    assertCondition(result.status === 'CURRENT', 'batch.control_not_current', 'only the current control revision can be attached');
+    assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING' || batch.status === 'UNDER_REVIEW', 'batch.controls_locked', 'control results can only be attached while the batch is executing or under review');
+    // Idempotent: retrying a failed upload must not duplicate or corrupt state.
+    if (batch.controlResultIds.includes(resultId)) return;
     batch.controlResultIds.push(resultId);
     batch.version += 1;
   }

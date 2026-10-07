@@ -10,6 +10,7 @@ export class QualityService {
     const batch = assertFound(this.store.batches.get(input.batchId), 'quality.batch_not_found', 'batch not found');
     assertCondition(result.batchId === batch.id && result.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'quality decision is outside the requested project');
     assertCondition(result.status === 'CURRENT', 'quality.result_not_current', 'only the current result revision can be reviewed');
+    assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING' || batch.status === 'UNDER_REVIEW', 'quality.batch_not_reviewable', 'batch is not open for quality review');
     const previous = [...this.store.quality.values()].find((decision) => decision.resultId === result.id && decision.projectId === input.projectId && decision.decision === input.decision && decision.ruleVersion === input.ruleVersion);
     if (previous) return previous;
     const decision: QualityDecision = {
@@ -27,10 +28,15 @@ export class QualityService {
     };
     this.store.quality.set(decision.id, decision);
     if (input.decision === 'RETEST_REQUIRED') {
-      batch.status = 'REJECTED';
+      // Reopen the batch for retest and drop every attached control reference so
+      // a previous round's passing controls cannot be reused by the next approval.
+      batch.status = 'RUNNING';
+      batch.controlResultIds = [];
       batch.version += 1;
+      this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'batch.reopened_for_retest', entity: 'batch', entityId: batch.id, metadata: { ruleVersion: input.ruleVersion, reviewerId: input.reviewerId } });
     } else if (input.decision === 'REJECTED') {
       batch.status = 'REJECTED';
+      batch.controlResultIds = [];
       batch.version += 1;
     }
     this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: `quality.${input.decision.toLowerCase()}`, entity: 'result', entityId: result.id, metadata: { batchId: batch.id, ruleVersion: input.ruleVersion, reviewerId: input.reviewerId } });
@@ -40,49 +46,47 @@ export class QualityService {
 
   approveBatch(batchId: string, reviewerId: string): void {
     const batch = assertFound(this.store.batches.get(batchId), 'quality.batch_not_found', 'batch not found');
+    // Idempotent: re-approving an approved batch is a no-op, not an error and
+    // never a second state transition.
+    if (batch.status === 'APPROVED') return;
     assertCondition(batch.status === 'RESULTS_PENDING' || batch.status === 'UNDER_REVIEW', 'quality.batch_not_reviewable', 'batch is not ready for approval');
     const currentResults = [...this.store.results.values()].filter((result) => result.batchId === batch.id && result.status === 'CURRENT');
     assertCondition(currentResults.length > 0, 'quality.no_results', 'batch has no current results');
-    const controlKinds = this.countControlKinds(batch.id, currentResults);
-    // A failed control upload can leave an old id on the batch and satisfy the gate.
+    // Every result must trace back to the member set frozen when the run started.
+    const frozenMembers = new Set(batch.frozenMemberAliquotIds ?? batch.memberAliquotIds);
+    for (const result of currentResults) {
+      if (result.aliquotId !== undefined) {
+        assertCondition(frozenMembers.has(result.aliquotId), 'quality.result_outside_members', `result ${result.id} belongs to an aliquot outside the frozen batch members`);
+      }
+    }
+    const approvedResultIds = new Set<string>();
+    const rejectedResultIds = new Set<string>();
+    for (const decision of this.store.quality.values()) {
+      if (decision.batchId !== batch.id) continue;
+      if (decision.decision === 'APPROVED') approvedResultIds.add(decision.resultId);
+      else rejectedResultIds.add(decision.resultId);
+    }
+    for (const result of currentResults) {
+      assertCondition(approvedResultIds.has(result.id), 'quality.result_unapproved', `result ${result.id} has not been approved`);
+      assertCondition(!rejectedResultIds.has(result.id), 'quality.result_rejected', `result ${result.id} carries a rejecting quality decision`);
+    }
+    // Control gate: only current revisions of this batch, explicitly attached in
+    // this round, count. Historical, superseded or foreign control results never
+    // satisfy the frozen requirements.
     const attachedControls = new Set(batch.controlResultIds);
+    const controlCounts = new Map<string, number>();
     for (const result of currentResults) {
-      if (result.controlKind && !attachedControls.has(result.id)) {
-        controlKinds.set(result.controlKind, (controlKinds.get(result.controlKind) ?? 0) + 1);
-      }
+      if (result.controlKind === undefined || !attachedControls.has(result.id)) continue;
+      controlCounts.set(result.controlKind, (controlCounts.get(result.controlKind) ?? 0) + 1);
     }
-    for (const controlId of batch.controlResultIds) {
-      const historical = [...this.store.results.values()].find((result) => result.id === controlId);
-      if (historical?.controlKind) {
-        controlKinds.set(historical.controlKind, (controlKinds.get(historical.controlKind) ?? 0) + 1);
-      }
-    }
-    for (const requirement of batch.requiredControls) {
-      assertCondition((controlKinds.get(requirement.kind) ?? 0) >= requirement.minimumCount, 'quality.control_missing', `missing control: ${requirement.kind}`);
-    }
-    for (const result of currentResults) {
-      const decisions = [...this.store.quality.values()].filter((decision) => decision.resultId === result.id && decision.decision === 'APPROVED');
-      assertCondition(decisions.length > 0, 'quality.result_unapproved', `result ${result.id} has not been approved`);
+    const requirements = batch.frozenControlRequirements ?? batch.requiredControls;
+    for (const requirement of requirements) {
+      assertCondition((controlCounts.get(requirement.kind) ?? 0) >= requirement.minimumCount, 'quality.control_missing', `missing control: ${requirement.kind}`);
     }
     batch.status = 'APPROVED';
     batch.approvedAt = this.store.now();
     batch.version += 1;
     this.store.addAudit({ tenantId: batch.tenantId, projectId: batch.projectId, action: 'batch.approved', entity: 'batch', entityId: batch.id, metadata: { reviewerId, resultCount: currentResults.length } });
     this.store.addOutbox({ tenantId: batch.tenantId, projectId: batch.projectId, topic: 'batch.approved', aggregateId: batch.id, payload: JSON.stringify({ batchId: batch.id, reviewerId }) });
-  }
-
-  private countControlKinds(batchId: string, currentResults: Array<{ id: string; batchId: string; controlKind?: 'BLANK' | 'CALIBRATION' | 'POSITIVE_CONTROL' | 'NEGATIVE_CONTROL' }>): Map<string, number> {
-    const counts = new Map<string, number>();
-    const batch = assertFound(this.store.batches.get(batchId), 'quality.batch_not_found', 'batch not found');
-    const currentIds = new Set(currentResults.map((result) => result.id));
-    for (const result of currentResults) {
-      if (result.controlKind && result.batchId === batchId) counts.set(result.controlKind, (counts.get(result.controlKind) ?? 0) + 1);
-    }
-    for (const id of batch.controlResultIds) {
-      if (currentIds.has(id)) continue;
-      const historical = this.store.results.get(id);
-      if (historical?.controlKind) counts.set(historical.controlKind, (counts.get(historical.controlKind) ?? 0) + 1);
-    }
-    return counts;
   }
 }

@@ -34,6 +34,7 @@ export class ResultService {
   registerRun(input: RegisterRunInput): InstrumentRun {
     const existing = [...this.store.runs.values()].find((run) => run.projectId === input.projectId && run.externalRunId === input.externalRunId);
     if (existing) {
+      assertCondition(existing.batchId === input.batchId && existing.tenantId === input.tenantId, 'result.run_conflict', 'external run id is already registered to a different batch');
       assertCondition(existing.rawFileHash === input.rawFileHash, 'result.run_conflict', 'external run id has a different raw file');
       return existing;
     }
@@ -61,6 +62,12 @@ export class ResultService {
     const run = assertFound(this.store.runs.get(input.runId), 'result.run_not_found', 'instrument run not found');
     const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
     assertCondition(run.batchId === batch.id && run.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'result does not belong to the requested batch');
+    assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING' || batch.status === 'UNDER_REVIEW', 'result.batch_not_accepting', 'batch is not accepting results in its current status');
+    assertCondition(run.status !== 'FAILED', 'result.run_failed', 'cannot ingest results from a failed instrument run');
+    if (input.aliquotId !== undefined) {
+      const members = batch.frozenMemberAliquotIds ?? batch.memberAliquotIds;
+      assertCondition(members.includes(input.aliquotId), 'result.aliquot_not_member', 'result aliquot is not a member of the frozen batch');
+    }
     const current = this.findCurrent(input);
     if (current) {
       if (current.contentHash === input.contentHash) return current;

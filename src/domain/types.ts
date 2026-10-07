@@ -122,6 +122,8 @@ export interface AnalysisBatch extends Versioned {
   createdAt: string;
   startedAt?: string;
   frozenAt?: string;
+  frozenMemberAliquotIds?: AliquotId[];
+  frozenControlRequirements?: ControlRequirement[];
   approvedAt?: string;
 }
 
